@@ -45,6 +45,8 @@ pub struct RootManifest {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct VersionManifest {
     pub downloads: VersionDownloads,
+    pub id: String,
+    pub libraries: Vec<Library>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -60,6 +62,64 @@ pub struct DownloadInfo {
     pub sha1: String,
     pub size: u64,
     pub url: Url,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct Library {
+    pub downloads: LibraryDownloads,
+    #[serde(skip_serializing_if = "LibraryExtractInstructions::is_empty", default)]
+    pub extract: LibraryExtractInstructions,
+    pub name: String,
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    pub natives: HashMap<OsName, String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub rules: Vec<Rule>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LibraryExtractInstructions {
+    pub exclude: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LibraryDownloads {
+    pub artifact: LibraryDownload,
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    pub classifiers: HashMap<String, LibraryDownload>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LibraryDownload {
+    pub path: String,
+    pub sha1: String,
+    pub size: u64,
+    pub url: Url,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum OsName {
+    Linux,
+    Windows,
+    Osx,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct Rule {
+    pub action: RuleAction,
+    pub os: Option<OsRule>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RuleAction {
+    Allow,
+    Disallow,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct OsRule {
+    pub name: OsName,
 }
 
 impl RootManifest {
@@ -106,6 +166,126 @@ impl DownloadInfo {
             .error_for_status()?
             .text()
             .await
+    }
+}
+
+impl OsName {
+    pub fn current() -> Self {
+        #[cfg(target_os = "windows")]
+        let current = Self::Windows;
+        #[cfg(target_os = "linux")]
+        let current = Self::Linux;
+        #[cfg(target_os = "macos")]
+        let current = Self::Osx;
+
+        current
+    }
+
+    pub fn is_current(&self) -> bool {
+        self == &Self::current()
+    }
+}
+
+impl OsRule {
+    pub fn allow(&self) -> bool {
+        self.name.is_current()
+    }
+}
+
+impl Rule {
+    pub fn allow(&self) -> bool {
+        match self.action {
+            RuleAction::Allow => self.os.as_ref().map_or(true, |os| os.allow()),
+            RuleAction::Disallow => self.os.as_ref().map_or(false, |os| !os.allow()),
+        }
+    }
+}
+
+impl Library {
+    pub async fn download(
+        &self,
+    ) -> reqwest::Result<Option<((String, Bytes), Option<(String, Bytes)>)>> {
+        if !self.rules.iter().all(Rule::allow) {
+            return Ok(None);
+        }
+        let artifact = (
+            self.downloads.artifact.path.clone(),
+            self.downloads.artifact.download().await?,
+        );
+        let natives = if let Some(natives_key) = self.natives.get(&OsName::current()) {
+            if let Some(natives_artifact) = self.downloads.classifiers.get(natives_key) {
+                Some((
+                    natives_artifact.path.clone(),
+                    natives_artifact.download().await?,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(Some((artifact, natives)))
+    }
+
+    pub async fn download_as_stream(
+        &self,
+    ) -> reqwest::Result<
+        Option<(
+            (String, impl Stream<Item = reqwest::Result<Bytes>>),
+            Option<(String, impl Stream<Item = reqwest::Result<Bytes>>)>,
+        )>,
+    > {
+        if !self.rules.iter().all(Rule::allow) {
+            return Ok(None);
+        }
+        let artifact = (
+            self.downloads.artifact.path.clone(),
+            self.downloads.artifact.download_as_stream().await?,
+        );
+        let native = if let Some(native_artifact) = self.native() {
+            Some((
+                native_artifact.path.clone(),
+                native_artifact.download_as_stream().await?,
+            ))
+        } else {
+            None
+        };
+        Ok(Some((artifact, native)))
+    }
+
+    pub fn artifact(&self) -> &LibraryDownload {
+        &self.downloads.artifact
+    }
+
+    pub fn native(&self) -> Option<&LibraryDownload> {
+        self.natives
+            .get(&OsName::current())
+            .and_then(|natives_key| self.downloads.classifiers.get(natives_key))
+    }
+}
+
+impl LibraryDownload {
+    pub async fn download(&self) -> reqwest::Result<Bytes> {
+        reqwest::get(self.url.clone())
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await
+    }
+
+    pub async fn download_as_stream(
+        &self,
+    ) -> reqwest::Result<impl Stream<Item = reqwest::Result<Bytes>>> {
+        Ok(reqwest::get(self.url.clone())
+            .await?
+            .error_for_status()?
+            .bytes_stream())
+    }
+}
+
+impl LibraryExtractInstructions {
+    pub fn is_empty(&self) -> bool {
+        self.exclude.is_empty()
     }
 }
 
